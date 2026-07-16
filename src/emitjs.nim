@@ -192,6 +192,17 @@ proc emitCall(e: var JsEmitter; n: var Cursor) =
     let lv = exprToStr(n)                    # target: seq push, or string reassign
     e.emit("(" & lv & " = __append(" & lv & ", "); emitExpr(e, n); e.emit("))")
     while n.kind != ParRi: skip n
+  elif name == "newSeq" or name == "newSeqUninit" or name == "newSeqOfCap" or
+       name == "newSeqUninitialized":
+    skip n                                   # seq constructors -> JS array
+    if name == "newSeq" and n.kind != ParRi:
+      e.emit("new Array("); emitExpr(e, n); e.emit(").fill(0)")  # newSeq(n) -> n zeros
+    else:
+      e.emit("[]")
+    while n.kind != ParRi: skip n
+  elif name == "newString":
+    skip n; e.emit("\"\"")                    # newString(n) -> empty string
+    while n.kind != ParRi: skip n
   elif name == "$":
     skip n; e.emit("String("); emitExpr(e, n); e.emit(")")
     while n.kind != ParRi: skip n
