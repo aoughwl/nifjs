@@ -127,6 +127,14 @@ proc strAdd(nm: string) =
 var floatVars: seq[string] = @[]
 proc floatAdd(nm: string) =
   if not listHas(floatVars, nm): floatVars.add nm
+
+## names (mangled) of locals/params whose static type is a std/sets `HashSet`/
+## `OrderedSet`. These map to a native JS `Set`, so `len(s)` must emit `.size`
+## (not the seq/array `.length`) and a `contains`/`in` test must emit `.has`.
+## Filled by emitLocal/collectParams when the declared type is a set instance.
+var setVars: seq[string] = @[]
+proc setAdd(nm: string) =
+  if not listHas(setVars, nm): setVars.add nm
 ## tuple locals -> the float element indices (base62-free, small): `t[2]` on a
 ## `(1, "two", 3.0)` must show `3.0`. Parallel seqs keyed by tuple var name.
 var tupleVars: seq[string] = @[]
@@ -224,6 +232,34 @@ proc typeNamed(c: Cursor): int =
     elif t == StringTagId or t == CstringTagId: return 2
     else: return 0
   else: return 0
+
+## true iff a type node denotes a std/sets `HashSet`/`OrderedSet` (unwrapping
+## mut/out/sink/lent/rangetype). Such a value maps to a native JS `Set`.
+proc isSetType(c: Cursor): bool =
+  var n = c
+  while n.kind == ParLe and (n.tagEnum == MutTagId or n.tagEnum == OutTagId or
+        n.tagEnum == SinkTagId or n.tagEnum == LentTagId or n.tagEnum == RangetypeTagId):
+    inc n
+  if n.kind == Symbol or n.kind == SymbolDef or n.kind == Ident:
+    let nm = opName(pool.syms[n.symId])
+    return nm == "HashSet" or nm == "OrderedSet"
+  return false
+
+## true iff the expression (unwrapping a leading haddr/hderef) is a known set var
+## — the set operand of an `incl`/`excl`/`contains`/`len` magic call.
+proc operandIsSet(c: Cursor): bool =
+  var n = c
+  if n.kind == ParLe and (n.tagEnum == HaddrTagId or n.tagEnum == HderefTagId):
+    inc n
+  if n.kind == Symbol or n.kind == SymbolDef or n.kind == Ident:
+    return listHas(setVars, mangle(pool.syms[n.symId]))
+  return false
+
+## at a `(call CALLEE ARG0 …)` with `n` positioned on the callee symbol, is the
+## first argument a set var? (peeks a copy; does not advance `n`).
+proc callFirstArgIsSet(c: Cursor): bool =
+  var p = c; inc p                     # past the callee -> first arg
+  operandIsSet(p)
 
 ## true iff the conversion source `n` yields a JS `string` that models a nimony
 ## `char` — a char var/param, a `CharLit`, an index into a `string`, or a nested
@@ -475,6 +511,17 @@ proc emitBoxArg(e: var JsEmitter; n: var Cursor) =
     lv = exprToStr(n)
   e.emit("{get v(){return " & lv & ";}, set v(_x){" & lv & " = _x;}}")
 
+proc setOperandStr(n: var Cursor): string =
+  ## consume one set operand (a `(haddr s)` from a `var`-param call, or a bare `s`)
+  ## and return its JS expression — the receiver of a native `Set` method.
+  if n.kind == ParLe and (n.tagEnum == HaddrTagId or n.tagEnum == HderefTagId):
+    inc n
+    result = exprToStr(n)
+    while n.kind != ParRi: skip n
+    consumeParRi n
+  else:
+    result = exprToStr(n)
+
 proc emitCall(e: var JsEmitter; n: var Cursor) =
   ## (call CALLEE ARGS…) / (cmd …). echo -> write(stdout,X) -> __w(X); the common
   ## seq/string builtins map to native JS; everything else is a plain call.
@@ -491,11 +538,31 @@ proc emitCall(e: var JsEmitter; n: var Cursor) =
     # `len` yields a 64-bit int. In faithful mode that is a `bigint`, so wrap the
     # native `.length` (a JS `number`) — otherwise `xs.len - 1` mixes bigint with
     # number (the surrounding int64 arithmetic emits its `1` as `1n`). emitIdx
-    # coerces back with Number(), so index uses stay correct.
+    # coerces back with Number(), so index uses stay correct. A HashSet maps to a
+    # native `Set`, whose element count is `.size` (NOT `.length`).
+    let prop = if callFirstArgIsSet(n): ".size)" else: ".length)"
     skip n
     if faithfulMode: e.emit("BigInt(")
-    e.emit("("); emitExpr(e, n); e.emit(".length)")
+    e.emit("("); emitExpr(e, n); e.emit(prop)
     if faithfulMode: e.emit(")")
+    while n.kind != ParRi: skip n
+  elif name == "initHashSet" and magic:
+    skip n; e.emit("new Set()")               # std/sets: fresh empty HashSet
+    while n.kind != ParRi: skip n
+  elif name == "incl" and magic and callFirstArgIsSet(n):
+    skip n                                     # callee
+    let sv = setOperandStr(n)                  # set receiver (drop the (haddr …))
+    e.emit("(" & sv & ".add("); emitExpr(e, n); e.emit("))")
+    while n.kind != ParRi: skip n
+  elif name == "excl" and magic and callFirstArgIsSet(n):
+    skip n                                     # callee
+    let sv = setOperandStr(n)
+    e.emit("(" & sv & ".delete("); emitExpr(e, n); e.emit("))")
+    while n.kind != ParRi: skip n
+  elif name == "contains" and magic and callFirstArgIsSet(n):
+    skip n                                     # callee
+    let sv = setOperandStr(n)                  # `x in s` -> s.has(x)
+    e.emit("(" & sv & ".has("); emitExpr(e, n); e.emit("))")
     while n.kind != ParRi: skip n
   elif name == "[]" and magic:
     skip n                                   # callee
@@ -1037,6 +1104,7 @@ proc collectParams(e: var JsEmitter; n: var Cursor): seq[string] =
       of 1: charAdd pnm
       of 2: strAdd pnm
       else: discard
+      if isSetType(typeCur): setAdd pnm        # HashSet param -> native JS Set
       if isFloatType(typeCur): floatAdd pnm    # float params -> echo/$ show .0
       skip n                       # type
       while n.kind != ParRi: skip n
@@ -1133,6 +1201,8 @@ proc emitLocal(e: var JsEmitter; n: var Cursor) =
   let nm = mangle(pool.syms[sh.name])
   let big = faithfulMode and int64Kind(sh.typ) > 0
   if big: bigAdd nm
+  let isSet = isSetType(sh.typ)               # HashSet -> native JS Set
+  if isSet: setAdd nm
   let tn = typeNamed(sh.typ)                  # distinguish char (charCodeAt) from string
   if tn == 1: charAdd nm
   elif tn == 2:
@@ -1156,6 +1226,8 @@ proc emitLocal(e: var JsEmitter; n: var Cursor) =
   if sh.hasInit:
     var ic = sh.init
     e.emit(" = "); emitExpr(e, ic, big)
+  elif isSet:
+    e.emit(" = new Set()")                 # uninitialised HashSet -> empty JS Set
   else:
     e.emit(if big: " = 0n" else: " = 0")   # uninitialised — JS-safe default
   e.emit(";")
