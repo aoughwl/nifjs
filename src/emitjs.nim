@@ -11,6 +11,13 @@
 ## comparisons with calls, echo, int/string/char literals). The fuller coverage
 ## (seq/obj/tuple/set/case/generics/var-params/shims) is being ported from the
 ## JS reference impl (aoughwl/aifjs-js), which is already language-complete.
+##
+## EXPORT MODES: the default "fast" mode maps every nimony int to JS `number`
+## (readable, but silently lossy past 2^53). The opt-in `--faithful` mode maps
+## width-64 ints (`int`/`int64`/`uint`/`uint64`) to native `bigint` and
+## width-wraps 64-bit arithmetic (`BigInt.asIntN/asUintN`), so int64/uint64 values
+## and overflow stay numerically exact. Faithful mode is strictly additive: with
+## `faithfulMode == false` every code path below is byte-for-byte the original.
 
 when defined(nimony):
   {.feature: "lenientnils".}
@@ -53,6 +60,30 @@ proc boxContains(nm: string): bool =
 
 proc emit(e: var JsEmitter; s: string) = e.js.add s
 
+## faithful-export mode (opt-in via the CLI `--faithful` flag). In faithful mode
+## width-64 integer types map to JS `bigint` and 64-bit arithmetic is width-wrapped
+## with `BigInt.asIntN/asUintN`, so values past 2^53 (and int64/uint64 overflow)
+## stay numerically exact. Default false keeps the original all-`number` fast mode
+## byte-for-byte — faithful mode is a strictly additive, opt-in path.
+var faithfulMode: bool = false
+proc setFaithful*(b: bool) = faithfulMode = b
+proc isFaithful*(): bool = faithfulMode
+
+## names (mangled) of locals/params that hold a `bigint` in faithful mode — lets
+## assignment RHS / conv coercions / return values know when a leaf must be bigint
+## (with the `n` suffix) rather than a plain `number`.
+var bigVars: seq[string] = @[]
+proc bigContains(nm: string): bool =
+  for b in bigVars:
+    if b == nm: return true
+  return false
+proc bigAdd(nm: string) =
+  if not bigContains(nm): bigVars.add nm
+
+## true iff the proc currently being emitted returns a 64-bit int (faithful mode);
+## a bare-literal `return` in such a proc must emit bigint.
+var curRetBig: bool = false
+
 ## a nimony symbol -> a stable, valid JS identifier.
 proc mangle(name: string): string =
   result = "v_"
@@ -82,8 +113,8 @@ proc jsString(s: string): string =
 
 # forward decls (same shape as interp.nim)
 proc emitStmt(e: var JsEmitter; n: var Cursor)
-proc emitExpr(e: var JsEmitter; n: var Cursor)
-proc exprToStr(n: var Cursor): string
+proc emitExpr(e: var JsEmitter; n: var Cursor; wantBig = false)
+proc exprToStr(n: var Cursor; wantBig = false): string
 proc emitCase(e: var JsEmitter; n: var Cursor; asExpr: bool)
 proc emitBoxArg(e: var JsEmitter; n: var Cursor)
 
@@ -133,6 +164,61 @@ proc joinList(xs: seq[string]; sep: string): string =
     first = false
     result.add x
 
+## classify a nimony type node for faithful mode: 0 = not a 64-bit int type,
+## 1 = signed 64-bit (int/int64), 2 = unsigned 64-bit (uint/uint64). Default `int`
+## and `int64` both encode as `(i 64)`; `uint`/`uint64` as `(u 64)`.
+proc int64Kind(c: Cursor): int =
+  var n = c
+  case n.kind
+  of Symbol, SymbolDef, Ident:
+    let nm = opName(pool.syms[n.symId])
+    if nm == "int" or nm == "int64" or nm == "Natural" or nm == "Positive": return 1
+    elif nm == "uint" or nm == "uint64": return 2
+    else: return 0
+  of ParLe:
+    let t = n.tagEnum
+    if t == ITagId or t == UTagId:
+      inc n
+      if n.kind == IntLit and pool.integers[n.intId] == 64:
+        return (if t == ITagId: 1 else: 2)
+      return 0
+    elif t == MutTagId or t == OutTagId or t == SinkTagId or t == LentTagId or
+         t == RangetypeTagId:
+      inc n
+      return int64Kind(n)
+    else: return 0
+  else: return 0
+
+## in faithful mode, does this expression already evaluate to a `bigint`? Used to
+## decide conv coercions (bigint->number needs `Number(...)`) and asgn/return leaves.
+proc producesBig(c: Cursor): bool =
+  if not faithfulMode: return false
+  var n = c
+  case n.kind
+  of Symbol, SymbolDef, Ident:
+    return bigContains(mangle(pool.syms[n.symId]))
+  of ParLe:
+    let t = n.tagEnum
+    if t == SufTagId:
+      inc n; skip n                     # (suf LIT "suffix")
+      if n.kind == StringLit:
+        let s = pool.strings[n.litId]
+        return s == "i64" or s == "u64"
+      return false
+    elif t == AddTagId or t == SubTagId or t == MulTagId or t == DivTagId or
+         t == ModTagId or t == ShlTagId or t == ShrTagId or t == AshrTagId or
+         t == BitandTagId or t == BitorTagId or t == BitxorTagId or t == NegTagId or
+         t == ConvTagId or t == HconvTagId:
+      inc n                             # arithmetic magics carry type as first child
+      return int64Kind(n) > 0
+    elif t == HderefTagId or t == HaddrTagId or t == ExprTagId:
+      inc n
+      return producesBig(n)
+    else:
+      return false
+  else:
+    return false
+
 proc emitStmts(e: var JsEmitter; n: var Cursor) =
   inc n
   while n.kind != ParRi: emitStmt(e, n)
@@ -144,19 +230,39 @@ proc emitBinop(e: var JsEmitter; n: var Cursor; op: string; t: TagEnum) =
   inc n
   var imul = false
   var wrap32 = false
-  if (t == AddTagId or t == SubTagId or t == MulTagId) and n.kind == ParLe and
-     (n.tagEnum == ITagId or n.tagEnum == UTagId):
+  var big64 = 0                   # 0=no, 1=signed, 2=unsigned (faithful mode)
+  if n.kind == ParLe and (n.tagEnum == ITagId or n.tagEnum == UTagId):
     var d = n; inc d
-    if d.kind == IntLit and pool.integers[d.intId] == 32:
+    let width = if d.kind == IntLit: pool.integers[d.intId] else: 0
+    if width == 32 and (t == AddTagId or t == SubTagId or t == MulTagId):
       if t == MulTagId: imul = true else: wrap32 = true
+    elif width == 64 and faithfulMode:
+      big64 = if n.tagEnum == ITagId: 1 else: 2
   skip n                          # the type node
   if imul:
     e.emit("Math.imul("); emitExpr(e, n); e.emit(", "); emitExpr(e, n); e.emit(")")
   elif wrap32:
     e.emit("(("); emitExpr(e, n); e.emit(op); emitExpr(e, n); e.emit(") | 0)")
+  elif big64 > 0:
+    # operands must both be bigint; add/sub/mul/shl and the bitwise ops can exceed
+    # the 64-bit range so wrap them, comparisons and >> stay bare.
+    let needWrap = t == AddTagId or t == SubTagId or t == MulTagId or t == ShlTagId or
+                   t == BitandTagId or t == BitorTagId or t == BitxorTagId
+    let wrapper = if big64 == 1: "_i64" else: "_u64"
+    if needWrap: e.emit(wrapper & "(") else: e.emit("(")
+    emitExpr(e, n, true); e.emit(op); emitExpr(e, n, true)
+    e.emit(")")
   else:
     e.emit("("); emitExpr(e, n); e.emit(op); emitExpr(e, n); e.emit(")")
   consumeParRi n
+
+## emit an array index. In faithful mode an index may be a `bigint` (64-bit int),
+## which JS rejects as an index, so coerce with `Number(...)` (a no-op for numbers).
+proc emitIdx(e: var JsEmitter; n: var Cursor) =
+  if faithfulMode:
+    e.emit("Number("); emitExpr(e, n); e.emit(")")
+  else:
+    emitExpr(e, n)
 
 proc emitBoxArg(e: var JsEmitter; n: var Cursor) =
   ## Box a var/out argument: (haddr LVAL) -> an accessor closing over the lval, so
@@ -186,7 +292,7 @@ proc emitCall(e: var JsEmitter; n: var Cursor) =
     skip n; e.emit("("); emitExpr(e, n); e.emit(".length)")
     while n.kind != ParRi: skip n
   elif name == "[]":
-    skip n; e.emit("("); emitExpr(e, n); e.emit("["); emitExpr(e, n); e.emit("])")
+    skip n; e.emit("("); emitExpr(e, n); e.emit("["); emitIdx(e, n); e.emit("])")
     while n.kind != ParRi: skip n
   elif name == "add":
     skip n
@@ -317,10 +423,11 @@ proc emitCase(e: var JsEmitter; n: var Cursor; asExpr: bool) =
   if asExpr: e.emit(" })(" & selStr & ")")
   else: e.emit(" }")
 
-proc emitExpr(e: var JsEmitter; n: var Cursor) =
+proc emitExpr(e: var JsEmitter; n: var Cursor; wantBig = false) =
+  let bigSfx = if wantBig: "n" else: ""
   case n.kind
-  of IntLit:  e.emit($pool.integers[n.intId]); inc n
-  of UIntLit: e.emit($pool.uintegers[n.uintId]); inc n
+  of IntLit:  e.emit($pool.integers[n.intId] & bigSfx); inc n
+  of UIntLit: e.emit($pool.uintegers[n.uintId] & bigSfx); inc n
   of FloatLit: e.emit($pool.floats[n.floatId]); inc n
   of CharLit: e.emit(jsString($n.charLit)); inc n
   of StringLit: e.emit(jsString(pool.strings[n.litId])); inc n
@@ -337,12 +444,19 @@ proc emitExpr(e: var JsEmitter; n: var Cursor) =
     elif t == DivTagId:
       inc n
       let isFloat = n.kind == ParLe and n.tagEnum == FTagId
+      let k = if faithfulMode and not isFloat: int64Kind(n) else: 0
       skip n
       if isFloat: (e.emit("("); emitExpr(e, n); e.emit(" / "); emitExpr(e, n); e.emit(")"))
+      elif k > 0: (e.emit("_idiv("); emitExpr(e, n, true); e.emit(", "); emitExpr(e, n, true); e.emit(")"))
       else: (e.emit("(Math.trunc("); emitExpr(e, n); e.emit(" / "); emitExpr(e, n); e.emit("))"))
       consumeParRi n
     elif t == ModTagId:
-      inc n; skip n; e.emit("("); emitExpr(e, n); e.emit(" % "); emitExpr(e, n); e.emit(")"); consumeParRi n
+      inc n
+      let k = if faithfulMode: int64Kind(n) else: 0
+      skip n
+      if k > 0: (e.emit("_imod("); emitExpr(e, n, true); e.emit(", "); emitExpr(e, n, true); e.emit(")"))
+      else: (e.emit("("); emitExpr(e, n); e.emit(" % "); emitExpr(e, n); e.emit(")"))
+      consumeParRi n
     elif t == AndTagId:
       inc n; e.emit("("); emitExpr(e, n); e.emit(" && "); emitExpr(e, n); e.emit(")"); consumeParRi n
     elif t == OrTagId:
@@ -350,22 +464,51 @@ proc emitExpr(e: var JsEmitter; n: var Cursor) =
     elif t == NotTagId:
       inc n; e.emit("(!"); emitExpr(e, n); e.emit(")"); consumeParRi n
     elif t == BitnotTagId:
-      inc n; e.emit("(~"); emitExpr(e, n); e.emit(")"); consumeParRi n
+      inc n
+      if faithfulMode and n.kind == ParLe and (n.tagEnum == ITagId or n.tagEnum == UTagId):
+        let k = int64Kind(n); skip n
+        if k > 0:
+          let w = if k == 1: "_i64" else: "_u64"
+          e.emit(w & "(~"); emitExpr(e, n, true); e.emit(")")
+        else: (e.emit("(~"); emitExpr(e, n); e.emit(")"))
+      else:
+        e.emit("(~"); emitExpr(e, n); e.emit(")")
+      consumeParRi n
+    elif t == NegTagId:
+      inc n
+      let k = if faithfulMode: int64Kind(n) else: 0
+      skip n
+      if k > 0:
+        let w = if k == 1: "_i64" else: "_u64"
+        e.emit(w & "(-"); emitExpr(e, n, true); e.emit(")")
+      else: (e.emit("(-"); emitExpr(e, n); e.emit(")"))
+      consumeParRi n
     elif t == HderefTagId or t == HaddrTagId:
       inc n
       if (n.kind == Symbol or n.kind == SymbolDef or n.kind == Ident) and
          boxContains(mangle(pool.syms[n.symId])):
         e.emit(mangle(pool.syms[n.symId]) & ".v"); inc n   # boxed var-param cell
       else:
-        emitExpr(e, n)
+        emitExpr(e, n, wantBig)
       while n.kind != ParRi: skip n
       consumeParRi n
     elif t == ConvTagId or t == HconvTagId:
       inc n                                     # (conv TYPE VALUE) -> VALUE
+      let targetK = if faithfulMode: int64Kind(n) else: 0
       let toInt = n.kind == ParLe and (n.tagEnum == ITagId or n.tagEnum == UTagId)
-      skip n
-      if toInt and n.kind == CharLit: (e.emit($int(n.charLit)); inc n)   # ord('A') -> 65
-      else: emitExpr(e, n)
+      skip n                                    # target type; n now at source expr
+      if targetK > 0:
+        # narrower/number/float source -> bigint: BigInt() then width-wrap.
+        let w = if targetK == 1: "_i64" else: "_u64"
+        if n.kind == CharLit: (e.emit(w & "(BigInt(" & $int(n.charLit) & "))"); inc n)
+        elif looksFloat(n): (e.emit(w & "(BigInt(Math.trunc("); emitExpr(e, n); e.emit(")))"))
+        else: (e.emit(w & "(BigInt("); emitExpr(e, n); e.emit("))"))
+      elif faithfulMode and producesBig(n):
+        # 64-bit (bigint) source -> narrower int / number / float target.
+        e.emit("Number("); emitExpr(e, n, true); e.emit(")")
+      else:
+        if toInt and n.kind == CharLit: (e.emit($int(n.charLit)); inc n)   # ord('A') -> 65
+        else: emitExpr(e, n)
       while n.kind != ParRi: skip n
       consumeParRi n
     elif t == IfTagId:                          # if-EXPRESSION -> IIFE
@@ -422,7 +565,14 @@ proc emitExpr(e: var JsEmitter; n: var Cursor) =
       while n.kind != ParRi: skip n
       consumeParRi n
     elif t == SufTagId:
-      inc n; emitExpr(e, n)                     # (suf VALUE TYPE) -> VALUE
+      inc n                                     # (suf LIT "suffix") -> LIT
+      var big = wantBig
+      if faithfulMode:
+        var probe = n; skip probe
+        if probe.kind == StringLit:
+          let sfx = pool.strings[probe.litId]
+          if sfx == "i64" or sfx == "u64": big = true
+      emitExpr(e, n, big)
       while n.kind != ParRi: skip n
       consumeParRi n
     elif t == AconstrTagId:
@@ -444,11 +594,11 @@ proc emitExpr(e: var JsEmitter; n: var Cursor) =
       while n.kind != ParRi: skip n
       consumeParRi n
     elif t == AtTagId or t == ArratTagId:
-      inc n; e.emit("("); emitExpr(e, n); e.emit("["); emitExpr(e, n); e.emit("])")
+      inc n; e.emit("("); emitExpr(e, n); e.emit("["); emitIdx(e, n); e.emit("])")
       while n.kind != ParRi: skip n
       consumeParRi n
     elif t == ExprTagId:
-      inc n; emitExpr(e, n)                     # (expr VALUE) -> VALUE
+      inc n; emitExpr(e, n, wantBig)            # (expr VALUE) -> VALUE
       while n.kind != ParRi: skip n
       consumeParRi n
     elif t == OconstrTagId:
@@ -505,10 +655,25 @@ proc collectParams(e: var JsEmitter; n: var Cursor): seq[string] =
   ## navigation is the shared HL-IR skeleton (hlwalk.decodeParams); here we only
   ## mangle to JS names and mark var/out params for boxing.
   result = @[]
-  for p in decodeParams(n):
-    let pnm = mangle(pool.syms[p.name])
-    result.add pnm
-    if p.byRef: curBoxed.add pnm               # var/out param -> boxed
+  inc n
+  while n.kind != ParRi:
+    if n.kind == ParLe and n.tagEnum == ParamTagId:
+      inc n
+      let pnm = mangle(pool.syms[n.symId]); inc n
+      skip n                       # export
+      skip n                       # pragmas
+      var byRef = false
+      if n.kind == ParLe and (n.tagEnum == MutTagId or n.tagEnum == OutTagId):
+        byRef = true               # var/out param -> boxed
+      if faithfulMode and not byRef and int64Kind(n) > 0: bigAdd pnm
+      skip n                       # type
+      while n.kind != ParRi: skip n
+      consumeParRi n
+      result.add pnm
+      if byRef: curBoxed.add pnm
+    else:
+      skip n
+  consumeParRi n
 
 proc emitProc(e: var JsEmitter; n: var Cursor) =
   ## (proc :name … (params …) RETTYPE … (stmts BODY)). Shape via hlwalk.decodeProc;
@@ -522,11 +687,20 @@ proc emitProc(e: var JsEmitter; n: var Cursor) =
   if sh.hasParams:
     var pc = sh.params
     params = collectParams(e, pc)              # also fills curBoxed
+  # faithful: does this routine return a 64-bit int? (ret type follows params)
+  let savedRetBig = curRetBig
+  curRetBig = false
+  if faithfulMode and sh.hasParams:
+    var rc = sh.params
+    skip rc                                    # past (params …)
+    if rc.kind != ParRi and not (rc.kind == ParLe and rc.tagEnum == StmtsTagId):
+      if int64Kind(rc) > 0: curRetBig = true
   if sh.hasBody:
     e.emit("function " & name & "(" & joinList(params, ", ") & "){\n")
     var bc = sh.body
     emitStmts(e, bc)
     e.emit("\n}\n")
+  curRetBig = savedRetBig
   curBoxed = savedBoxed
 
 proc emitLocal(e: var JsEmitter; n: var Cursor) =
@@ -535,17 +709,23 @@ proc emitLocal(e: var JsEmitter; n: var Cursor) =
   ## then the initializer (a `.` dot if none).
   let sh = decodeLocal(n)
   let nm = mangle(pool.syms[sh.name])
+  let big = faithfulMode and int64Kind(sh.typ) > 0
+  if big: bigAdd nm
   e.emit("let " & nm)
   if sh.hasInit:
     var ic = sh.init
-    e.emit(" = "); emitExpr(e, ic)
+    e.emit(" = "); emitExpr(e, ic, big)
   else:
-    e.emit(" = 0")           # uninitialised — JS-safe default
+    e.emit(if big: " = 0n" else: " = 0")   # uninitialised — JS-safe default
   e.emit(";")
 
 proc emitAsgn(e: var JsEmitter; n: var Cursor) =
   inc n
-  emitExpr(e, n); e.emit(" = "); emitExpr(e, n); e.emit(";")
+  # if the lvalue is a known bigint local, a bare-literal RHS must be bigint too.
+  var lhsBig = false
+  if faithfulMode and (n.kind == Symbol or n.kind == SymbolDef or n.kind == Ident):
+    lhsBig = bigContains(mangle(pool.syms[n.symId]))
+  emitExpr(e, n); e.emit(" = "); emitExpr(e, n, lhsBig); e.emit(";")
   consumeParRi n
 
 proc emitIf(e: var JsEmitter; n: var Cursor) =
@@ -571,13 +751,13 @@ proc emitRet(e: var JsEmitter; n: var Cursor) =
   inc n
   if n.kind == ParRi: e.emit("return;")
   else:
-    e.emit("return "); emitExpr(e, n); e.emit(";")
+    e.emit("return "); emitExpr(e, n, curRetBig); e.emit(";")
   consumeParRi n
 
-proc exprToStr(n: var Cursor): string =
+proc exprToStr(n: var Cursor; wantBig = false): string =
   ## emit one expression into a fresh buffer (for building loop headers).
   var tmp = JsEmitter(js: "")
-  emitExpr(tmp, n)
+  emitExpr(tmp, n, wantBig)
   result = tmp.js
 
 proc collExpr(n: var Cursor): string =
@@ -638,24 +818,38 @@ proc emitFor(e: var JsEmitter; n: var Cursor) =
       coll = collExpr(n)
   # loop variables (1 or 2), from (unpackflat (let :v …)…)
   var vars: seq[string] = @[]
+  var loopBig = false                 # counter is a 64-bit int -> bigint (faithful)
   if n.kind == ParLe and n.tagEnum == UnpackflatTagId:
     inc n
+    var firstVar = true
     while n.kind != ParRi:
       if n.kind == ParLe and (n.tagEnum == LetTagId or n.tagEnum == VarTagId):
         inc n
-        vars.add mangle(pool.syms[n.symId]); inc n
-        while n.kind != ParRi: skip n
+        let vnm = mangle(pool.syms[n.symId])
+        vars.add vnm; inc n
+        skip n                         # export
+        skip n                         # pragmas
+        if firstVar and faithfulMode and int64Kind(n) > 0:
+          loopBig = true
+          bigAdd vnm
+        firstVar = false
+        while n.kind != ParRi: skip n  # type, value
         consumeParRi n
       else: skip n
     consumeParRi n
   else:
     skip n
   let v0 = if vars.len > 0: vars[0] else: "v__i"
+  # counter loops over bigint bounds: wrap the endpoints so `i`, the comparison and
+  # `i++` / `i -= step` all stay bigint (BigInt() is a no-op on an existing bigint).
+  let la = if loopBig: "BigInt(" & a & ")" else: a
+  let lb = if loopBig: "BigInt(" & b & ")" else: b
+  let lstep = if loopBig: "BigInt(" & step & ")" else: step
   if kind == 1:
-    e.emit("for(let " & v0 & " = " & a & "; " & v0 & cmp & b & "; " & v0 & "++){\n")
+    e.emit("for(let " & v0 & " = " & la & "; " & v0 & cmp & lb & "; " & v0 & "++){\n")
     emitStmt(e, n); e.emit("\n}")
   elif kind == 2:
-    e.emit("for(let " & v0 & " = " & a & "; " & v0 & " >= " & b & "; " & v0 & " -= " & step & "){\n")
+    e.emit("for(let " & v0 & " = " & la & "; " & v0 & " >= " & lb & "; " & v0 & " -= " & lstep & "){\n")
     emitStmt(e, n); e.emit("\n}")
   elif vars.len >= 2:           # for i, x in coll -> indexed
     e.emit("{ const _c = " & coll & "; for(let " & vars[0] & " = 0; " & vars[0] &
@@ -760,6 +954,14 @@ proc emitModule*(root: var Cursor): string =
   e.emit("function __w(x){ __out += (x===true?'true':x===false?'false':String(x)); }\n")
   e.emit("function __wf(x){ __out += (Number.isInteger(x) ? x + '.0' : String(x)); }\n")
   e.emit("function __append(c, x){ if(typeof c === 'string') return c + x; c.push(x); return c; }\n")
+  if faithfulMode:
+    # faithful-export runtime: 64-bit ints are JS `bigint`; wrap arithmetic to the
+    # exact two's-complement width and guard integer division. (echo prints a bigint
+    # via String(x), i.e. "5" not "5n", so no writer change is needed.)
+    e.emit("const _i64 = (x) => BigInt.asIntN(64, x);\n")
+    e.emit("const _u64 = (x) => BigInt.asUintN(64, x);\n")
+    e.emit("const _idiv = (a, b) => { if (b === 0n) throw new Error(\"DivByZero\"); return a / b; };\n")
+    e.emit("const _imod = (a, b) => { if (b === 0n) throw new Error(\"DivByZero\"); return a % b; };\n")
   # root is the module `(stmts …)`: procs float up (JS hoists function decls),
   # top-level runs at module scope, then we return the captured output.
   emitStmt(e, root)

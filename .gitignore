@@ -1,2 +1,5 @@
 nimcache/
 *.js
+!runtime/aowl-rt.js
+bin/
+tests/_out_faithful/
