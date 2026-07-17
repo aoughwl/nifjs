@@ -849,6 +849,13 @@ proc emitExpr(e: var JsEmitter; n: var Cursor; wantBig = false) =
       e.emit("." & mangle(pool.syms[n.symId])); inc n
       while n.kind != ParRi: skip n
       consumeParRi n
+    elif t == BaseobjTagId:
+      # (baseobj TYPE depth VALUE) — an upcast to a base object. In JS an upcast is
+      # identity (the same object reference), so emit just VALUE.
+      inc n; skip n; skip n                     # TYPE, depth
+      emitExpr(e, n)
+      while n.kind != ParRi: skip n
+      consumeParRi n
     elif t == TupconstrTagId:
       inc n; skip n                             # (tupconstr TYPE v… | (kv f v)…) -> [v…]
       e.emit("[")
