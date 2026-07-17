@@ -229,6 +229,7 @@ proc emitExpr(e: var JsEmitter; n: var Cursor; wantBig = false)
 proc exprToStr(n: var Cursor; wantBig = false): string
 proc emitCase(e: var JsEmitter; n: var Cursor; asExpr: bool)
 proc emitBoxArg(e: var JsEmitter; n: var Cursor)
+proc emitArrow(e: var JsEmitter; n: var Cursor)
 
 ## the JS operator for a binary-arithmetic/comparison tag, or "" if not one.
 proc binOp(t: TagEnum): string =
@@ -822,6 +823,21 @@ proc emitExpr(e: var JsEmitter; n: var Cursor; wantBig = false) =
       inc n; emitExpr(e, n, wantBig)            # (expr VALUE) -> VALUE
       while n.kind != ParRi: skip n
       consumeParRi n
+    elif t == StmtsTagId:
+      # a stmts block used as an expression. The one case aowljs produces this for
+      # is a nested proc value (a closure): `(stmts (proc :anon …) SYMREF)` — a local
+      # proc definition followed by a reference to it. Emit the proc as a JS arrow
+      # function; lexical capture is free in JS, so the returned arrow closes over the
+      # enclosing scope. The trailing self-reference is dropped.
+      inc n
+      var emitted = false
+      while n.kind != ParRi:
+        if not emitted and n.kind == ParLe and (n.tagEnum == ProcTagId or n.tagEnum == FuncTagId):
+          emitArrow(e, n); emitted = true
+        else:
+          skip n
+      if not emitted: e.emit("undefined")
+      consumeParRi n
     elif t == OconstrTagId or t == NewobjTagId:
       # (oconstr TYPE (kv f v) …) — a plain object literal {f:v,…}. A `ref object`
       # sem's as (newobj TYPE (kv f v) …): under JS's GC the ref is just the object
@@ -960,6 +976,38 @@ proc emitProc(e: var JsEmitter; n: var Cursor; isIter = false) =
     var bc = sh.body
     emitStmts(e, bc)
     e.emit("\n}\n")
+  curRetBig = savedRetBig
+  curBoxed = savedBoxed
+  curBigParams = savedBigParams
+
+proc emitArrow(e: var JsEmitter; n: var Cursor) =
+  ## Emit an anonymous/nested (proc …) as a JS arrow function value:
+  ##   (x) => { <body> }
+  ## Used for closures — the arrow captures the enclosing scope lexically, so a
+  ## `proc(x): int = x + n` returned from `makeAdder(n)` becomes `(x) => { … }`
+  ## that closes over `n`. A `(proctype …)` value needs no JS type annotation.
+  let sh = decodeProc(n)
+  var params: seq[string] = @[]
+  let savedBoxed = curBoxed
+  curBoxed = @[]
+  let savedBigParams = curBigParams
+  curBigParams = @[]
+  if sh.hasParams:
+    var pc = sh.params
+    params = collectParams(e, pc)
+  let savedRetBig = curRetBig
+  curRetBig = false
+  if faithfulMode and sh.hasParams:
+    var rc = sh.params
+    skip rc
+    if rc.kind != ParRi and not (rc.kind == ParLe and rc.tagEnum == StmtsTagId):
+      if int64Kind(rc) > 0: curRetBig = true
+  e.emit("(" & joinList(params, ", ") & ") => {\n")
+  for bp in curBigParams: e.emit("  " & bp & " = BigInt(" & bp & ");\n")
+  if sh.hasBody:
+    var bc = sh.body
+    emitStmts(e, bc)
+  e.emit("\n}")
   curRetBig = savedRetBig
   curBoxed = savedBoxed
   curBigParams = savedBigParams
