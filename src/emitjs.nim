@@ -121,6 +121,29 @@ proc opName(name: string): string =
     inc i
   result = name.strip(leading = false, chars = {'.'})
 
+## true iff `name` carries a generic-instance segment (`.<digits>.I<hash>` — e.g.
+## `add.0.I8fahwb`). Instance hashes start with a capital `I`; user-module hashes
+## are lowercase (`proxr24ld1`), so a leading capital `I` after the disambiguation
+## number reliably marks a monomorphized system/generic instance.
+proc isInstanceSym(name: string): bool =
+  var i = 0
+  while i + 2 < name.len:
+    if name[i] == '.' and name[i+1] in {'0'..'9'}:
+      var j = i + 1
+      while j < name.len and name[j] in {'0'..'9'}: inc j
+      if j + 1 < name.len and name[j] == '.' and name[j+1] == 'I': return true
+      i = j
+    else:
+      inc i
+  return false
+
+## true iff the callee is a *real* builtin/magic — a system-module symbol
+## (`.sysvq0asl`) or a generic instance — rather than a user proc that merely
+## shares a base name (`add`/`len`/`newSeq`/`$`/…). Gates every name-keyed magic
+## branch so a user `proc add`/`len`/… is emitted as a plain call, not hijacked.
+proc isMagicSym(name: string): bool =
+  result = name.contains("sysvq0asl") or isInstanceSym(name)
+
 ## classify a type node (unwrapping mut/out/sink/lent/rangetype) as char / string.
 ## 1 = char, 2 = string/cstring, 0 = neither.
 proc typeNamed(c: Cursor): int =
@@ -355,54 +378,98 @@ proc emitCall(e: var JsEmitter; n: var Cursor) =
   inc n
   let callee = if n.kind == Symbol or n.kind == SymbolDef: pool.syms[n.symId] else: ""
   let name = opName(callee)
+  let magic = isMagicSym(callee)   # gate name-keyed magics: user procs must not be hijacked
   if name == "write":
     skip n; skip n                # callee, stdout
     e.emit(if looksFloat(n): "__wf(" else: "__w(")
     emitExpr(e, n); e.emit(")")
     while n.kind != ParRi: skip n
-  elif name == "len":
+  elif name == "len" and magic:
     skip n; e.emit("("); emitExpr(e, n); e.emit(".length)")
     while n.kind != ParRi: skip n
-  elif name == "[]":
-    skip n; e.emit("("); emitExpr(e, n); e.emit("["); emitIdx(e, n); e.emit("])")
+  elif name == "[]" and magic:
+    skip n                                   # callee
+    let container = exprToStr(n)             # container (string/seq/array)
+    if n.kind == ParLe and n.tagEnum == InfixTagId:
+      # slice: (infix `..`/`..<` lo hi) -> JS .slice(lo, hi(+1))
+      var ic = n
+      inc ic
+      let sliceOp = opName(if ic.kind == Symbol or ic.kind == Ident: pool.syms[ic.symId] else: "")
+      inc ic
+      let lo = exprToStr(ic)
+      let hi = exprToStr(ic)
+      let lo2 = if faithfulMode: "Number(" & lo & ")" else: lo
+      let hi2 = if faithfulMode: "Number(" & hi & ")" else: hi
+      # `..` is inclusive (end = hi+1), `..<` is exclusive (end = hi)
+      let endStr = if sliceOp == "..<": hi2 else: "(" & hi2 & " + 1)"
+      e.emit(container & ".slice(" & lo2 & ", " & endStr & ")")
+      skip n                                 # the slice infix arg
+    else:
+      e.emit("(" & container & "["); emitIdx(e, n); e.emit("])")
     while n.kind != ParRi: skip n
-  elif name == "add":
+  elif name == "[]=" and magic:
+    skip n                                   # callee
+    var container = ""                       # (haddr LVAL) | LVAL
+    if n.kind == ParLe and (n.tagEnum == HaddrTagId or n.tagEnum == HderefTagId):
+      inc n; container = exprToStr(n)
+      while n.kind != ParRi: skip n
+      consumeParRi n
+    else:
+      container = exprToStr(n)
+    e.emit("(" & container & "["); emitIdx(e, n); e.emit("] = "); emitExpr(e, n); e.emit(")")
+    while n.kind != ParRi: skip n
+  elif name == "add" and magic:
     skip n
     let lv = exprToStr(n)                    # target: seq push, or string reassign
     e.emit("(" & lv & " = __append(" & lv & ", "); emitExpr(e, n); e.emit("))")
     while n.kind != ParRi: skip n
-  elif name == "newSeq" or name == "newSeqUninit" or name == "newSeqOfCap" or
-       name == "newSeqUninitialized":
+  elif (name == "newSeq" or name == "newSeqUninit" or name == "newSeqOfCap" or
+       name == "newSeqUninitialized") and magic:
     skip n                                   # seq constructors -> JS array
     if name == "newSeq" and n.kind != ParRi:
-      e.emit("new Array("); emitExpr(e, n); e.emit(").fill(0)")  # newSeq(n) -> n zeros
+      e.emit("new Array("); emitIdx(e, n); e.emit(").fill(0)")  # newSeq(n) -> n zeros
     else:
       e.emit("[]")
     while n.kind != ParRi: skip n
-  elif name == "newString":
+  elif name == "newString" and magic:
     skip n; e.emit("\"\"")                    # newString(n) -> empty string
     while n.kind != ParRi: skip n
-  elif name == "$":
+  elif name == "$" and magic:
     skip n; e.emit("String("); emitExpr(e, n); e.emit(")")
     while n.kind != ParRi: skip n
-  elif name == "inc":
+  elif (name == "==" or name == "!=" or name == "<" or name == "<=" or
+        name == ">" or name == ">=") and magic:
+    # operator-overload comparison emitted as a call (e.g. string ==/</>): JS
+    # strings compare lexicographically, so map to the native operator.
+    let jsOp = (if name == "==": " === " elif name == "!=": " !== " else: " " & name & " ")
+    skip n; e.emit("("); emitExpr(e, n); e.emit(jsOp); emitExpr(e, n); e.emit(")")
+    while n.kind != ParRi: skip n
+  elif name == "inc" and magic:
     skip n; e.emit("("); emitExpr(e, n)
     if n.kind != ParRi: (e.emit(" += "); emitExpr(e, n)) else: e.emit(" += 1")
     e.emit(")")
     while n.kind != ParRi: skip n
-  elif name == "&":
+  elif name == "&" and magic:
     skip n; e.emit("("); emitExpr(e, n); e.emit(" + "); emitExpr(e, n); e.emit(")")
     while n.kind != ParRi: skip n
-  elif name == "chr":
+  elif name == "chr" and magic:
     skip n; e.emit("String.fromCharCode("); emitExpr(e, n); e.emit(")")
     while n.kind != ParRi: skip n
-  elif name == "ord":
+  elif name == "ord" and magic:
     skip n; e.emit("("); emitExpr(e, n); e.emit(").charCodeAt(0)")
     while n.kind != ParRi: skip n
-  elif name == "abs":
+  elif name == "abs" and magic:
     skip n; e.emit("Math.abs("); emitExpr(e, n); e.emit(")")
     while n.kind != ParRi: skip n
-  elif name == "min" or name == "max" or name == "sqrt" or name == "floor" or
+  elif (name == "min" or name == "max") and magic:
+    skip n; e.emit("Math." & name & "(")
+    var mfirst = true
+    while n.kind != ParRi:
+      if not mfirst: e.emit(", ")
+      mfirst = false
+      emitExpr(e, n)
+    e.emit(")")
+  elif name == "sqrt" or name == "floor" or
        name == "ceil" or name == "round" or name == "trunc" or name == "sin" or
        name == "cos" or name == "tan" or name == "exp" or name == "ln" or name == "pow":
     let jn = if name == "ln": "log" else: name    # math.* -> Math.*
@@ -473,7 +540,10 @@ proc emitCase(e: var JsEmitter; n: var Cursor; asExpr: bool) =
   var sel = default(Cursor)
   let branches = decodeCase(n, sel)
   var selc = sel
-  let selStr = exprToStr(selc)
+  # faithful: a 64-bit-int selector is a bigint but the `of` labels are numbers,
+  # so `_s === 0` is always false — coerce the selector to Number for comparison.
+  let selStr = if faithfulMode and producesBig(sel): "Number(" & exprToStr(selc) & ")"
+               else: exprToStr(selc)
   if asExpr: e.emit("(function(_s){ ")
   else: e.emit("{ const _s = " & selStr & "; ")
   var first = true
@@ -656,13 +726,20 @@ proc emitExpr(e: var JsEmitter; n: var Cursor; wantBig = false) =
       while n.kind != ParRi: skip n
       consumeParRi n
     elif t == AconstrTagId:
-      inc n; skip n                             # (aconstr TYPE e0 e1 …) -> [e0,e1,…]
+      inc n                                     # (aconstr TYPE e0 e1 …) -> [e0,e1,…]
+      # faithful: if the element type is a 64-bit int, emit bigint elements so a
+      # later `s + xs[i]` (bigint arithmetic) doesn't mix bigint with number.
+      var elemBig = false
+      if faithfulMode and n.kind == ParLe and n.tagEnum == ArrayTagId:
+        var tc = n; inc tc                      # (array ELEMTYPE lengthtype)
+        elemBig = int64Kind(tc) > 0
+      skip n                                    # type
       e.emit("[")
       var first = true
       while n.kind != ParRi:
         if not first: e.emit(", ")
         first = false
-        emitExpr(e, n)
+        emitExpr(e, n, elemBig)
       e.emit("]"); consumeParRi n
     elif t == PrefixTagId:
       inc n                                     # (prefix OP X) — @seq / $tostring
@@ -954,8 +1031,14 @@ proc emitFor(e: var JsEmitter; n: var Cursor) =
     e.emit("for(let " & v0 & " = " & la & "; " & v0 & " >= " & lb & "; " & v0 & " -= " & lstep & "){\n")
     emitStmt(e, n); e.emit("\n}")
   elif vars.len >= 2:           # for i, x in coll -> indexed
-    e.emit("{ const _c = " & coll & "; for(let " & vars[0] & " = 0; " & vars[0] &
-           " < _c.length; " & vars[0] & "++){ const " & vars[1] & " = _c[" & vars[0] & "];\n")
+    # faithful: a 64-bit index var is a bigint, but `_c.length` and the JS index
+    # slot are `number` — start at 0n, compare against BigInt(length), coerce the
+    # element read with Number(i).
+    let i0 = if loopBig: "0n" else: "0"
+    let len = if loopBig: "BigInt(_c.length)" else: "_c.length"
+    let idxRead = if loopBig: "Number(" & vars[0] & ")" else: vars[0]
+    e.emit("{ const _c = " & coll & "; for(let " & vars[0] & " = " & i0 & "; " & vars[0] &
+           " < " & len & "; " & vars[0] & "++){ const " & vars[1] & " = _c[" & idxRead & "];\n")
     emitStmt(e, n); e.emit("\n} }")
   else:
     e.emit("for(const " & v0 & " of " & coll & "){\n")
@@ -1046,16 +1129,21 @@ proc scanProcBoxed(n: var Cursor) =
     while n.kind != ParRi: scanProcBoxed(n)
     consumeParRi n
 
-proc emitModule*(root: var Cursor): string =
-  var scanCur = root
-  scanEnums(scanCur)            # collect enum ordinals from a separate cursor
-  var scanCur2 = root
-  scanProcBoxed(scanCur2)       # collect var/out param positions per routine
+proc jsPrelude*(): string =
+  ## the once-per-program runtime shim (echo capture, float print, seq/str append,
+  ## and — in faithful mode — the 64-bit bigint wrappers).
   var e = JsEmitter(js: "")
   e.emit("'use strict';\nlet __out='';\n")
   e.emit("function __w(x){ __out += (x===true?'true':x===false?'false':String(x)); }\n")
   e.emit("function __wf(x){ __out += (Number.isInteger(x) ? x + '.0' : String(x)); }\n")
-  e.emit("function __append(c, x){ if(typeof c === 'string') return c + x; c.push(x); return c; }\n")
+  if faithfulMode:
+    # faithful: a bare int literal argument is a `number`, but the seq may hold
+    # `bigint` elements — coerce so a later `sum + xs[i]` doesn't mix the two.
+    e.emit("function __append(c, x){ if(typeof c === 'string') return c + x; " &
+           "if(typeof x === 'number' && c.length > 0 && typeof c[0] === 'bigint') x = BigInt(x); " &
+           "c.push(x); return c; }\n")
+  else:
+    e.emit("function __append(c, x){ if(typeof c === 'string') return c + x; c.push(x); return c; }\n")
   if faithfulMode:
     # faithful-export runtime: 64-bit ints are JS `bigint`; wrap arithmetic to the
     # exact two's-complement width and guard integer division. (echo prints a bigint
@@ -1064,8 +1152,25 @@ proc emitModule*(root: var Cursor): string =
     e.emit("const _u64 = (x) => BigInt.asUintN(64, x);\n")
     e.emit("const _idiv = (a, b) => { if (b === 0n) throw new Error(\"DivByZero\"); return a / b; };\n")
     e.emit("const _imod = (a, b) => { if (b === 0n) throw new Error(\"DivByZero\"); return a % b; };\n")
-  # root is the module `(stmts …)`: procs float up (JS hoists function decls),
-  # top-level runs at module scope, then we return the captured output.
-  emitStmt(e, root)
-  e.emit("\nreturn __out;\n")
   result = e.js
+
+proc jsFlush*(): string =
+  ## return the captured output once, at the end. (`return` at module top level is
+  ## legal — Node wraps every module file in a function.)
+  result = "\nreturn __out;\n"
+
+proc emitModuleBody*(root: var Cursor): string =
+  ## emit ONE module's JS (no prelude/flush): procs float up (JS hoists function
+  ## decls), top-level statements run at module scope. Enum-ordinal and var/out
+  ## param scans accumulate into the shared tables so cross-module calls resolve.
+  var scanCur = root
+  scanEnums(scanCur)
+  var scanCur2 = root
+  scanProcBoxed(scanCur2)
+  var e = JsEmitter(js: "")
+  emitStmt(e, root)
+  result = e.js
+
+proc emitModule*(root: var Cursor): string =
+  ## single-module convenience: full standalone JS (prelude + body + flush).
+  result = jsPrelude() & emitModuleBody(root) & jsFlush()
