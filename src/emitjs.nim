@@ -918,10 +918,12 @@ proc collectParams(e: var JsEmitter; n: var Cursor): seq[string] =
       skip n
   consumeParRi n
 
-proc emitProc(e: var JsEmitter; n: var Cursor) =
+proc emitProc(e: var JsEmitter; n: var Cursor; isIter = false) =
   ## (proc :name … (params …) RETTYPE … (stmts BODY)). Shape via hlwalk.decodeProc;
   ## params come before the body in the grammar, so collect (filling curBoxed)
   ## then emit — a forward decl (no stmts) emits nothing, as before.
+  ## `isIter` marks an (iterator …) routine, emitted as a JS `function*` generator
+  ## (its `(yld v)` bodies become `yield v`); a `for x in it(…)` then `for..of`s it.
   let sh = decodeProc(n)
   let rawName = pool.syms[sh.name]
   # ARC/RTTI hook instances (`=destroy`/`=wasmoved`/`=dup`/`=copy`/`=sinkh`/`=trace`)
@@ -949,7 +951,8 @@ proc emitProc(e: var JsEmitter; n: var Cursor) =
     if rc.kind != ParRi and not (rc.kind == ParLe and rc.tagEnum == StmtsTagId):
       if int64Kind(rc) > 0: curRetBig = true
   if sh.hasBody:
-    e.emit("function " & name & "(" & joinList(params, ", ") & "){\n")
+    let kw = if isIter: "function* " else: "function "
+    e.emit(kw & name & "(" & joinList(params, ", ") & "){\n")
     # coerce plain bigint params so an untyped-literal argument (a bare `number`)
     # can't mix with bigint arithmetic inside the body. BigInt() is a no-op on an
     # existing bigint, so typed callers are unaffected.
@@ -1049,11 +1052,14 @@ proc collExpr(n: var Cursor): string =
       consumeParRi n
       return
     if t == CallTagId or t == HcallTagId:
-      inc n
-      let callee = if n.kind == Symbol or n.kind == SymbolDef: pool.syms[n.symId] else: ""
+      # inspect the callee via a probe so an unmatched call keeps `n` at the `(call`
+      # for the exprToStr fallthrough below (a bare iterator call, e.g. `evens(10)`,
+      # must be emitted whole as the for..of iterable — not unwrapped).
+      var probe = n; inc probe
+      let callee = if probe.kind == Symbol or probe.kind == SymbolDef: pool.syms[probe.symId] else: ""
       let name = opName(callee)
       if name == "items" or name == "mitems" or name == "pairs" or name == "toOpenArray":
-        inc n
+        inc n; inc n                 # past the `(call` and its callee -> the collection
         result = collExpr(n)
         while n.kind != ParRi: skip n
         consumeParRi n
@@ -1161,6 +1167,11 @@ proc emitStmt(e: var JsEmitter; n: var Cursor) =
   elif t == ContinueTagId: (e.emit("continue;"); skip n)
   elif isCallTag(t): (emitCall(e, n); e.emit(";"))
   elif t == ProcTagId or t == FuncTagId: emitProc(e, n)
+  elif t == IteratorTagId: emitProc(e, n, isIter = true)
+  elif t == YldTagId:
+    inc n                                       # (yld VALUE) -> yield VALUE;
+    e.emit("yield "); emitExpr(e, n, curRetBig); e.emit(";")
+    consumeParRi n
   else: skip n
 
 proc scanEnums(n: var Cursor) =
@@ -1195,7 +1206,7 @@ proc scanProcBoxed(n: var Cursor) =
   if n.kind != ParLe:
     inc n
     return
-  if n.tagEnum == ProcTagId or n.tagEnum == FuncTagId:
+  if n.tagEnum == ProcTagId or n.tagEnum == FuncTagId or n.tagEnum == IteratorTagId:
     inc n
     let pname = opName(pool.syms[n.symId]); inc n
     var idxs: seq[int] = @[]
