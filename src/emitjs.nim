@@ -158,12 +158,63 @@ var curRetBig: bool = false
 ## into the body's bigint arithmetic and trigger a JS mix-BigInt-and-number error.
 var curBigParams: seq[string] = @[]
 
-## a nimony symbol -> a stable, valid JS identifier.
+## JS/TS reserved words that can't stand as a bare identifier — a pretty name that
+## lands on one is prefixed with `_`.
+var jsReserved: seq[string] = @["if","for","class","return","function","var","let",
+  "const","new","delete","typeof","instanceof","in","of","do","while","switch",
+  "case","default","break","continue","this","super","null","true","false","void",
+  "yield","await","async","static","import","export","extends","enum","try","catch",
+  "finally","throw","with","debugger"]
+proc isReservedJs(s: string): bool =
+  for r in jsReserved:
+    if r == s: return true
+  return false
+
+## GLOBAL rename table: original full nimony symbol (`fib.1.main`) -> a readable,
+## valid JS identifier (`fib`). Parallel seqs (nimony's `Table.[]=` is `.raises`).
+## `renameTaken` is the set of pretty names already handed out — pre-seeded with the
+## emitter's own runtime helpers / IIFE+loop temporaries so no USER symbol can ever
+## shadow them. First sight of a symbol claims its base name; a base already taken by
+## a DIFFERENT symbol gets `_2`, `_3`, … until unique (guaranteed collision-free;
+## over-disambiguates same-named locals in distinct scopes — acceptable for v1).
+var renameKeys: seq[string] = @[]
+var renameVals: seq[string] = @[]
+var renameTaken: seq[string] = @["__out","__w","__wf","__sf","__append",
+  "_i64","_u64","_idiv","_imod","_s","_v","_c","_i","_a","_b","_r","_x","_ex","v__i"]
+proc prettyTaken(p: string): bool =
+  for a in renameTaken:
+    if a == p: return true
+  return false
+
+## the readable base of a nimony symbol: the segment before the first `.`, sanitized
+## to a valid JS identifier and guarded against reserved words / bad starts / empty.
+proc prettyBase(name: string): string =
+  var res = ""
+  var i = 0
+  while i < name.len and name[i] != '.':
+    let ch = name[i]
+    if ch in {'A'..'Z', 'a'..'z', '0'..'9', '_'}: res.add ch
+    else: res.add '_'
+    inc i
+  if res.len == 0: res = "_"
+  elif res[0] in {'0'..'9'}: res = "_" & res
+  if isReservedJs(res): res = "_" & res
+  return res
+
+## a nimony symbol -> a stable, readable, valid JS identifier (see renameTaken).
 proc mangle(name: string): string =
-  result = "v_"
-  for ch in name:
-    if ch in {'A'..'Z', 'a'..'z', '0'..'9', '_'}: result.add ch
-    else: result.add '_'
+  for i in 0 ..< renameKeys.len:
+    if renameKeys[i] == name: return renameVals[i]
+  let base = prettyBase(name)
+  var cand = base
+  var k = 2
+  while prettyTaken(cand):
+    cand = base & "_" & $k
+    inc k
+  renameKeys.add name
+  renameVals.add cand
+  renameTaken.add cand
+  return cand
 
 ## bare callee/operator name — everything before the first `.<digit>`.
 proc opName(name: string): string =
